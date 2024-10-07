@@ -1,0 +1,297 @@
+
+roi =  roi.geometry()
+Map.centerObject(roi,12)
+
+// Load the geeSharp module
+var geeSharp = require("users/aazuspan/geeSharp:geeSharp");
+
+// Obtain the landsat8 datasets
+var collection = ee.ImageCollection('LANDSAT/LE07/C02/T1_TOA')
+  .filterDate("1999-06-01", "1999-10-31")
+  .filterBounds(roi)
+  .filter(ee.Filter.lte('CLOUD_COVER',30));
+print('collection',collection);
+
+// Synthesize and crop the image
+var composite = collection.median().clip(roi).select(["B8", "B7", "B5", "B4", "B3", "B2","B1"]);
+print('composite', composite);
+Map.addLayer(composite, { bands: ["B5", "B4", "B3"], min: 0, max: 0.4 }, "RGB");
+
+// Select the bands to sharpen--in this case, the visible bands.
+var ms = composite.select(["B7", "B5", "B4", "B3", "B2","B1"]).reproject("EPSG:32646",null,30);
+// Select the panchromatic band to use for sharpening.
+var pan = composite.select(["B8"]).reproject("EPSG:32646",null,15);
+
+// Sharpen the multispectral bands to the panchromatic resolution
+print('geeSharp.methods', geeSharp.methods);
+var sharp = geeSharp.sharpen(ms, pan, "brovey");
+
+// Add layers to the map
+Map.addLayer(ms, {bands: ["B5", "B4", "B3"], min: 0, max: 0.4 }, "Unsharpened");
+Map.addLayer(sharp, {bands: ["B5", "B4", "B3"], min: 0, max: 0.4 }, "Sharpened");
+
+// To calculate a quality metric after pan-sharpening, be sure to reproject the original image to the sharpened resolution.
+var reproj = ms.resample("bilinear").reproject(pan.projection());
+// print('ms reproj resolution', reproj.select('B2').projection().nominalScale());
+// Then calculate band-wise RMSE to quantify error introduced by sharpening.
+var quality = geeSharp.quality(reproj, sharp, "RMSE");
+// print('quality', quality);
+
+print('Unsharpened resolution', ms.select('B2').projection().nominalScale());
+print('Sharpened resolution',sharp.select('B2').projection().nominalScale());
+
+
+// Step 2: Define a function to calculate water indices (MNDWI, AWEIsh, WI2015)
+function calculateIndices(image){
+  var MNDWI = image.expression(
+    '((green - swir1) / (green + swir1))', {
+      'green': image.select('B2'),
+      'swir1': image.select('B5')
+    }
+  ).rename('MNDWI');
+
+  var AWEIsh = image.expression(
+    '(blue + 2.5 * green - 1.5 * (nir + swir1) - 0.25 * swir2)', {
+      'blue': image.select('B1'),
+      'green': image.select('B2'),
+      'nir': image.select('B4'),
+      'swir1': image.select('B5'),
+      'swir2': image.select('B7')
+    }
+  ).rename('AWEIsh');
+
+  var WI2015 = image.expression(
+    '(1.7204 + 171 * green + 3 * red + 70 * nir - 45 * swir1 - 71 * swir2)', {
+      'green': image.select('B2'),
+      'red': image.select('B3'),
+      'nir': image.select('B4'),
+      'swir1': image.select('B5'),
+      'swir2': image.select('B7')
+    }
+  ).rename('WI2015');
+
+  return image.addBands([MNDWI, AWEIsh, WI2015]);
+}
+
+// Apply the water indices calculation to the image
+var landsat8_with_indices = calculateIndices(sharp);
+
+var mndwi =  landsat8_with_indices.select("MNDWI")
+var awei =  landsat8_with_indices.select("AWEIsh")
+var wi =  landsat8_with_indices.select("WI2015")
+
+// Merge Water and NonWater sample data
+var sample = water1999.merge(nonwater1999);
+
+
+// Add a random column to the sample collection
+var sampleWithRandom = sample.randomColumn('random');
+
+// Split the sample into 70% training and 30% validation based on the random column
+var trainingSample = sampleWithRandom.filter(ee.Filter.lt('random', 0.7));  // 70% for training
+var validationSample = sampleWithRandom.filter(ee.Filter.gte('random', 0.7));  // 30% for validation
+
+
+// Select the water indices
+var indices = landsat8_with_indices.select(['MNDWI', 'AWEIsh', 'WI2015']);
+
+// Sample training data from the indices image
+var training = indices.sampleRegions({
+  collection: trainingSample,
+  properties: ['Class'],  // Ensure 'Class' is consistently used in both training and validation
+  scale: 15
+});
+
+// Train the classifier using MNDWI index only
+var classifiermndwi = ee.Classifier.smileRandomForest(100).train({
+  features: training,
+  classProperty: 'Class',  // Ensure consistency
+  inputProperties: ['WI2015']
+});
+
+// Classify the image based on MNDWI
+var classifiedmndwi = indices.classify(classifiermndwi);
+Map.addLayer(classifiedmndwi, {min: 0, max: 1, palette: ['blue', 'green']}, 'Water Classification MNDWI');
+Map.addLayer(awei, {min: -1, max: 0.6}, 'AWEIsh');
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////
+print(validationSample)
+
+// Sample validation data (should be independent, but using same for demonstration)
+var validationmndwi = indices.sampleRegions({
+  collection: validationSample,
+  properties: ['Class'],  // Ensure consistency with the 'Class' property
+  scale: 15
+});
+
+// Classify the validation data
+var validatedmndwi = validationmndwi.classify(classifiermndwi);
+
+// Create a confusion matrix
+var confusionMatrix = validatedmndwi.errorMatrix('Class', 'classification');
+
+// Print the confusion matrix, accuracy, and kappa coefficient
+print('Confusion Matrix MNDWI:', confusionMatrix);
+print('Overall Accuracy MNDWI:', confusionMatrix.accuracy());
+print('Kappa Coefficient MNDWI:', confusionMatrix.kappa());
+
+print('Classified Validation MNDWI:', validatedmndwi);
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+print(ui.Chart.image.histogram(awei,roi, 15 ))
+
+// Use lower scale to avoid edges from small buildings
+var scale = 15
+var bounds = roi
+var cannyThreshold = 0.7
+var cannySigma = 1
+var minValue = -0.2
+// Set debug=false if you do not want the charts
+var debug = true
+// Set this higher to discard smaller edges
+var minEdgeLength = 40
+var th = computeThresholdUsingOtsu(
+  awei, scale, bounds, cannyThreshold, cannySigma, minValue, debug, minEdgeLength)
+print('Threshold', th)
+var waterOtsu = awei.gt(th);
+
+
+var waterVis = {min:0, max:1, palette: ['white', 'blue']}
+
+
+
+Map.addLayer(waterOtsu.selfMask(), waterVis, 'MNDWI with Otsu Thresholding') 
+
+
+/***
+ * Compute a threshold using Otsu method (bimodal)
+ */
+function computeThresholdUsingOtsu(image, scale, bounds, cannyThreshold, cannySigma, minValue, debug, minEdgeLength, minEdgeGradient, minEdgeValue) {
+    // clip image edges
+    var bufferDistance = ee.Number(scale).multiply(10).multiply(-1)
+    var mask = image.mask().clip(bounds.buffer(bufferDistance));
+
+    // detect sharp changes
+    var edge = ee.Algorithms.CannyEdgeDetector(image, cannyThreshold, cannySigma);
+    edge = edge.multiply(mask);
+    
+    if(minEdgeLength) {
+        var connected = edge.mask(edge).lt(cannyThreshold).connectedPixelCount(200, true);
+
+        var edgeLong = connected.gte(minEdgeLength);
+
+        if(debug) {
+          print('Edge length: ', ui.Chart.image.histogram(connected, bounds, scale, buckets))
+          
+          Map.addLayer(edge.mask(edge), {palette:['ff0000']}, 'edges (short)', false);
+        }
+
+        edge = edgeLong;
+    }
+    
+    // buffer around NDWI edges
+    var edgeBuffer = edge.focal_max(ee.Number(scale), 'square', 'meters');
+    if(minEdgeValue) {
+      var edgeMin = image.reduceNeighborhood(ee.Reducer.min(), ee.Kernel.circle(ee.Number(scale), 'meters'))
+
+      edgeBuffer = edgeBuffer.updateMask(edgeMin.gt(minEdgeValue))
+
+      if(debug) {
+        Map.addLayer(edge.updateMask(edgeBuffer), {palette:['ff0000']}, 'edge min', false);
+      }
+    }
+
+    if(minEdgeGradient) {
+      var edgeGradient = image.gradient().abs().reduce(ee.Reducer.max()).updateMask(edgeBuffer.mask())
+
+      var edgeGradientTh = ee.Number(edgeGradient.reduceRegion(ee.Reducer.percentile([minEdgeGradient]), bounds, scale).values().get(0))
+
+      if(debug) {e
+        print('Edge gradient threshold: ', edgeGradientTh)
+        
+        Map.addLayer(edgeGradient.mask(edgeGradient), {palette:['ff0000']}, 'edge gradient', false);
+
+        print('Edge gradient: ', ui.Chart.image.histogram(edgeGradient, bounds, scale, buckets))
+      }
+      
+      edgeBuffer = edgeBuffer.updateMask(edgeGradient.gt(edgeGradientTh))
+    }
+
+    edge = edge.updateMask(edgeBuffer)
+    var edgeBuffer = edge.focal_max(ee.Number(scale).multiply(1), 'square', 'meters');
+    var imageEdge = image.mask(edgeBuffer);
+
+    if(debug) {
+      Map.addLayer(imageEdge, {palette:['222200', 'ffff00']}, 'image edge buffer', false)
+    }
+    
+    // compute threshold using Otsu thresholding
+    var buckets = 100;
+    var hist = ee.Dictionary(ee.Dictionary(imageEdge.reduceRegion(ee.Reducer.histogram(buckets), bounds, scale)).values().get(0));
+    var threshold = ee.Algorithms.If(hist.contains('bucketMeans'), otsu(hist), minValue);
+    threshold = ee.Number(threshold)
+
+    if(debug) {
+        // experimental
+        // var jrc = ee.Image('JRC/GSW1_0/GlobalSurfaceWater').select('occurrence')
+        // var jrcTh = ee.Number(ee.Dictionary(jrc.updateMask(edge).reduceRegion(ee.Reducer.mode(), bounds, scale)).values().get(0))
+        // var water = jrc.gt(jrcTh)
+        // Map.addLayer(jrc, {palette: ['000000', 'ffff00']}, 'JRC')
+        // print('JRC occurrence (edge)', ui.Chart.image.histogram(jrc.updateMask(edge), bounds, scale, buckets))
+
+        Map.addLayer(edge.mask(edge), {palette:['ff0000']}, 'edges', true);
+
+        print('Threshold: ', threshold);
+
+        print('Image values:', ui.Chart.image.histogram(image, bounds, scale, buckets));
+        print('Image values (edge): ', ui.Chart.image.histogram(imageEdge, bounds, scale, buckets));
+        Map.addLayer(mask.mask(mask), {palette:['000000']}, 'image mask', false);
+    }
+
+    return minValue !== 'undefined' ? threshold.max(minValue) : threshold;
+}
+
+function otsu(histogram) {
+    histogram = ee.Dictionary(histogram);
+
+    var counts = ee.Array(histogram.get('histogram'));
+    var means = ee.Array(histogram.get('bucketMeans'));
+    var size = means.length().get([0]);
+    var total = counts.reduce(ee.Reducer.sum(), [0]).get([0]);
+    var sum = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]);
+    var mean = sum.divide(total);
+
+    var indices = ee.List.sequence(1, size);
+
+    // Compute between sum of squares, where each mean partitions the data.
+    var bss = indices.map(function(i) {
+        var aCounts = counts.slice(0, 0, i);
+        var aCount = aCounts.reduce(ee.Reducer.sum(), [0]).get([0]);
+        var aMeans = means.slice(0, 0, i);
+        var aMean = aMeans.multiply(aCounts)
+            .reduce(ee.Reducer.sum(), [0]).get([0])
+            .divide(aCount);
+        var bCount = total.subtract(aCount);
+        var bMean = sum.subtract(aCount.multiply(aMean)).divide(bCount);
+        return aCount.multiply(aMean.subtract(mean).pow(2)).add(
+            bCount.multiply(bMean.subtract(mean).pow(2)));
+    });
+
+    // Return the mean value corresponding to the maximum BSS.
+    return means.sort(bss).get([-1]);
+};
+
+
+var waterOtsuMask = waterOtsu.selfMask()
+
+var waterOtsuVector = waterOtsuMask.reduceToVectors({scale:15,
+geometryType: "Polygon",
+maxPixels :  1e13})
+
+// Export.table.toDrive({
+//   collection: waterOtsuVector,
+//   description: 'River_Polygon',
+//   fileFormat: 'SHP'
+// });
